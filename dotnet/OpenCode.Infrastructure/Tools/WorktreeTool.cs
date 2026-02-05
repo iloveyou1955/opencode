@@ -20,7 +20,7 @@ public class WorktreeTool : ITool
     {
       "type": "object",
       "properties": {
-        "action": { "type": "string", "enum": ["create", "list", "remove"], "description": "The action to perform" },
+        "action": { "type": "string", "enum": ["create", "list", "remove", "reset"], "description": "The action to perform" },
         "name": { "type": "string", "description": "Name for the new worktree (for create)" },
         "startCommand": { "type": "string", "description": "Optional startup script (for create)" },
         "directory": { "type": "string", "description": "Directory of the worktree to remove" }
@@ -53,6 +53,12 @@ public class WorktreeTool : ITool
                     if (string.IsNullOrEmpty(directory)) return "Error: Directory is required for remove action.";
                     await _worktreeService.RemoveAsync(directory);
                     return $"Worktree at {directory} removed successfully.";
+
+                case "reset":
+                    var target = args["directory"]?.ToString();
+                    if (string.IsNullOrEmpty(target)) return "Error: Directory is required for reset action.";
+                    await _worktreeService.ResetAsync(target);
+                    return $"Worktree at {target} reset successfully.";
 
                 default:
                     return $"Error: Unknown action '{action}'";

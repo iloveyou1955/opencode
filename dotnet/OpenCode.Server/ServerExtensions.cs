@@ -221,6 +221,13 @@ public static class ServerExtensions
             return Results.Ok();
         });
 
+        app.MapPost("/worktree/reset", async ([FromBody] JsonObject body, WorktreeService worktreeService) => {
+            var directory = body["directory"]?.ToString();
+            if (string.IsNullOrEmpty(directory)) return Results.BadRequest("Directory is required");
+            await worktreeService.ResetAsync(directory);
+            return Results.Ok();
+        });
+
         // ACP
         app.MapPost("/acp/initialize", ([FromBody] AcpInitializeRequest request, AcpService acpService) => {
             var response = acpService.Initialize(request);
