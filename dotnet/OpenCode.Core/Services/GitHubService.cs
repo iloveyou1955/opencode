@@ -164,8 +164,8 @@ public class GitHubService
 
     private string? MatchSessionId(string text)
     {
-        // 匹配 opencode.ai/s/xxxx 或 opencode.ai/share/xxxx
-        var match = System.Text.RegularExpressions.Regex.Match(text, @"opencode\.ai/(?:s|share)/([a-zA-Z0-9]+)");
+        // 匹配 opencode.ai/opncd.ai 的分享链接
+        var match = System.Text.RegularExpressions.Regex.Match(text, @"(?:opencode\.ai|opncd\.ai)/(?:s|share)/([a-zA-Z0-9]+)");
         return match.Success ? match.Groups[1].Value : null;
     }
 
@@ -245,5 +245,20 @@ public class GitHubService
     public class GitHubBranchInfo
     {
         public string Ref { get; set; } = "";
+        [JsonPropertyName("repo")]
+        public GitHubRepository? Repository { get; set; }
+    }
+
+    public class GitHubRepository
+    {
+        public string Name { get; set; } = "";
+        [JsonPropertyName("full_name")]
+        public string FullName { get; set; } = "";
+        public GitHubRepoOwner Owner { get; set; } = new();
+    }
+
+    public class GitHubRepoOwner
+    {
+        public string Login { get; set; } = "";
     }
 }
