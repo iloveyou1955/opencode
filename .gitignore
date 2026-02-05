@@ -27,3 +27,7 @@ target
 opencode-dev
 logs/
 *.bun-build
+
+dotnet/**/bin/
+dotnet/**/obj/
+

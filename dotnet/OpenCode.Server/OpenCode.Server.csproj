@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <ItemGroup>
+    <ProjectReference Include="..\OpenCode.Core\OpenCode.Core.csproj" />
+    <ProjectReference Include="..\OpenCode.AgentFramework\OpenCode.AgentFramework.csproj" />
+    <ProjectReference Include="..\OpenCode.Infrastructure\OpenCode.Infrastructure.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+</Project>
