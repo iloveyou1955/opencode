@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Linq;
 using Microsoft.Extensions.Logging;
 using OpenCode.Core.Contracts;
 
@@ -181,10 +182,59 @@ public class WorktreeService
         }
     }
 
+    public async Task ResetAsync(string directory)
+    {
+        if (!Directory.Exists(directory))
+        {
+            throw new Exception($"Worktree directory not found: {directory}");
+        }
+
+        var branch = await GetPrimaryBranchAsync();
+        await RunGitAsync(new[] { "fetch", "origin", branch }, directory);
+        await RunGitAsync(new[] { "reset", "--hard", $"origin/{branch}" }, directory);
+        await RunGitAsync(new[] { "clean", "-fdx" }, directory);
+        await RunGitAsync(new[] { "submodule", "update", "--init", "--recursive", "--force" }, directory);
+    }
+
     private string Slug(string input)
     {
         return input.Trim().ToLower().Replace(" ", "-").Replace("\\", "-").Replace("/", "-");
     }
+
+    private async Task<string> GetPrimaryBranchAsync()
+    {
+        var head = await RunGitAsync(new[] { "symbolic-ref", "refs/remotes/origin/HEAD" }, _projectContext.Directory);
+        if (head.ExitCode == 0 && !string.IsNullOrWhiteSpace(head.Output))
+        {
+            var parts = head.Output.Trim().Split('/');
+            return parts.Last();
+        }
+
+        var main = await RunGitAsync(new[] { "show-ref", "--verify", "--quiet", "refs/remotes/origin/main" }, _projectContext.Directory);
+        if (main.ExitCode == 0) return "main";
+
+        var master = await RunGitAsync(new[] { "show-ref", "--verify", "--quiet", "refs/remotes/origin/master" }, _projectContext.Directory);
+        if (master.ExitCode == 0) return "master";
+
+        return "main";
+    }
+
+    private async Task<CommandResult> RunGitAsync(string[] args, string directory)
+    {
+        var process = await _shellService.SpawnAsync("git", args, directory);
+        var output = await process.StandardOutput.ReadToEndAsync();
+        var error = await process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync();
+
+        if (process.ExitCode != 0)
+        {
+            _logger.LogWarning("Git command failed: {Args}\n{Error}", string.Join(" ", args), error);
+        }
+
+        return new CommandResult(process.ExitCode, output.Trim(), error.Trim());
+    }
+
+    private record CommandResult(int ExitCode, string Output, string Error);
 
     private async Task RestoreEnvironmentAsync(string directory)
     {

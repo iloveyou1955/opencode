@@ -936,7 +936,11 @@ namespace OpenCode.TUI.Services
             if (subCommand == "switch" || parts.Length == 1)
             {
                 var providers = await discovery.GetModelsAsync();
-                var choices = providers.Values.SelectMany(p => p.Models.Values.Select(m => $"{p.Id}/{m.Id}")).ToList();
+                var choices = providers.Values
+                    .SelectMany(p => p.Models.Values.Select(m => $"{p.Id}/{m.Id}"))
+                    .OrderBy(m => m == "openai/gpt-5" ? 0 : 1)
+                    .ThenBy(m => m)
+                    .ToList();
                 choices.Add("取消");
                 
                 var selectedModel = AnsiConsole.Prompt(
@@ -1125,9 +1129,39 @@ namespace OpenCode.TUI.Services
                 context.Tui.UpdateStatus("Ready");
                 context.Tui.Render();
             }
+            else if (subCommand == "reset")
+            {
+                if (parts.Length < 3)
+                {
+                    context.Tui.AddSystemMessage("用法: worktree reset <directory_or_name>");
+                    context.Tui.Render();
+                    return;
+                }
+                var target = parts[2];
+                var list = await worktreeService.ListAsync();
+                var match = list.FirstOrDefault(w => w.Name == target || w.Directory == target);
+
+                if (match == null)
+                {
+                    context.Tui.AddSystemMessage($"找不到指定的 Worktree: {target}");
+                    context.Tui.Render();
+                    return;
+                }
+
+                if (AnsiConsole.Confirm($"[red]确定要重置 Worktree '{match.Name}' 吗？此操作会丢弃未提交更改。[/]"))
+                {
+                    context.Tui.UpdateStatus("正在重置...");
+                    context.Tui.Render();
+
+                    await worktreeService.ResetAsync(match.Directory);
+                    context.Tui.AddSystemMessage($"Worktree '{match.Name}' 已重置。");
+                    context.Tui.UpdateStatus("Ready");
+                    context.Tui.Render();
+                }
+            }
             else
             {
-                context.Tui.AddSystemMessage("未知 worktree 指令。可用: list, create [name], remove <name>, cleanup [days]");
+                context.Tui.AddSystemMessage("未知 worktree 指令。可用: list, create [name], remove <name>, reset <name>, cleanup [days]");
                 context.Tui.Render();
             }
         }
@@ -1304,6 +1338,7 @@ namespace OpenCode.TUI.Services
             {
                 table.AddRow("Branch", $"[cyan]{branch}[/]");
                 var repoInfo = await vcsService.GetRepoInfoAsync();
+                var projectContext = serviceProvider.GetRequiredService<IProjectContext>();
                 if (repoInfo != null)
                 {
                     table.AddRow("Repository", $"{repoInfo.Owner}/{repoInfo.Name}");
@@ -1650,7 +1685,7 @@ namespace OpenCode.TUI.Services
                     {
                         if (AnsiConsole.Confirm($"[yellow]在 PR #{prNumber} 中检测到 OpenCode 会话，是否导入并切换？[/]"))
                         {
-                            await HandleImportAsync($"import https://opencode.ai/s/{sessionKey}", context, serviceProvider);
+                            await HandleImportAsync($"import https://opncd.ai/s/{sessionKey}", context, serviceProvider);
                         }
                     }
                 }
@@ -1677,6 +1712,38 @@ namespace OpenCode.TUI.Services
                     {
                         context.Tui.AddSystemMessage("检出成功!");
                         if (!string.IsNullOrEmpty(output)) context.Tui.AddSystemMessage(output);
+
+                        if (repoInfo != null)
+                        {
+                            var pr = await ghService.GetPullRequestAsync(repoInfo.Owner, repoInfo.Name, prNumber);
+                            if (pr?.Head.Repository != null)
+                            {
+                                var headRepo = pr.Head.Repository;
+                                var isFork = headRepo.Owner.Login != repoInfo.Owner || headRepo.Name != repoInfo.Name;
+                                if (isFork)
+                                {
+                                    var remotes = await RunCommandAsync("git", "remote", projectContext.Directory);
+                                    if (remotes.ExitCode == 0 && !remotes.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries).Contains(headRepo.Owner.Login))
+                                    {
+                                        await RunCommandAsync(
+                                            "git",
+                                            $"remote add {headRepo.Owner.Login} https://github.com/{headRepo.Owner.Login}/{headRepo.Name}.git",
+                                            projectContext.Directory);
+                                        context.Tui.AddSystemMessage($"Added fork remote: {headRepo.Owner.Login}");
+                                    }
+
+                                    var branch = await RunCommandAsync("git", "rev-parse --abbrev-ref HEAD", projectContext.Directory);
+                                    if (branch.ExitCode == 0 && !string.IsNullOrWhiteSpace(branch.Output))
+                                    {
+                                        var localBranch = branch.Output.Trim();
+                                        await RunCommandAsync(
+                                            "git",
+                                            $"branch --set-upstream-to={headRepo.Owner.Login}/{pr.Head.Ref} {localBranch}",
+                                            projectContext.Directory);
+                                    }
+                                }
+                            }
+                        }
                     }
                     else
                     {
@@ -1813,6 +1880,29 @@ namespace OpenCode.TUI.Services
                 context.Tui.Render();
             }
         }
+
+        private static async Task<CommandResult> RunCommandAsync(string command, string arguments, string directory)
+        {
+            var psi = new ProcessStartInfo(command, arguments)
+            {
+                WorkingDirectory = directory,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            using var proc = Process.Start(psi);
+            if (proc == null) return new CommandResult(1, "", "Failed to start process");
+
+            var output = await proc.StandardOutput.ReadToEndAsync();
+            var error = await proc.StandardError.ReadToEndAsync();
+            await proc.WaitForExitAsync();
+
+            return new CommandResult(proc.ExitCode, output.Trim(), error.Trim());
+        }
+
+        private record CommandResult(int ExitCode, string Output, string Error);
 
         private async Task HandleDebugAsync(string input, CommandContext context, IServiceProvider serviceProvider)
         {

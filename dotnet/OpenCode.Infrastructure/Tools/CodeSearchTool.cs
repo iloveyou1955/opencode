@@ -1,10 +1,13 @@
 using System.Text;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
+using System.Net.Http.Json;
 using Microsoft.Extensions.FileSystemGlobbing;
 using Microsoft.Extensions.FileSystemGlobbing.Abstractions;
 using OpenCode.Core.Contracts;
 using OpenCode.Core.Utilities;
+using OpenCode.Core.Services;
 
 namespace OpenCode.Infrastructure.Tools;
 
@@ -16,10 +19,12 @@ public class CodeSearchTool : ITool
 {
     private readonly SearchCache? _cache;
     private readonly IProjectContext _projectContext;
+    private readonly HttpClient _httpClient;
 
-    public CodeSearchTool(IProjectContext projectContext, SearchCache? cache = null)
+    public CodeSearchTool(IProjectContext projectContext, IHttpClientFactory httpClientFactory, SearchCache? cache = null)
     {
         _projectContext = projectContext;
+        _httpClient = httpClientFactory.CreateClient();
         _cache = cache;
     }
 
@@ -33,7 +38,8 @@ public class CodeSearchTool : ITool
         "query": { "type": "string", "description": "搜索查询或正则表达式模式" },
         "include": { "type": "string", "description": "包含的文件 Glob 模式 (如 **/*.cs)" },
         "exclude": { "type": "string", "description": "排除的文件 Glob 模式" },
-        "caseSensitive": { "type": "boolean", "description": "是否区分大小写" }
+        "caseSensitive": { "type": "boolean", "description": "是否区分大小写" },
+        "tokensNum": { "type": "number", "description": "语义搜索返回的 token 数" }
       },
       "required": ["query"]
     }
@@ -45,6 +51,7 @@ public class CodeSearchTool : ITool
         string include = args["include"]?.ToString() ?? "**/*";
         string? exclude = args["exclude"]?.ToString();
         bool caseSensitive = args["caseSensitive"]?.GetValue<bool>() ?? false;
+        int tokensNum = args["tokensNum"]?.GetValue<int>() ?? 5000;
 
         if (string.IsNullOrEmpty(query)) return "错误: query 是必需的";
 
@@ -66,6 +73,16 @@ public class CodeSearchTool : ITool
 
         try
         {
+            if (Flag.EnableExa)
+            {
+                var exaResult = await ExecuteExaAsync(query, tokensNum, cancellationToken);
+                if (!string.IsNullOrEmpty(exaResult))
+                {
+                    _cache?.Set(cacheKey, exaResult);
+                    return exaResult;
+                }
+            }
+
             var matcher = new Matcher();
             matcher.AddInclude(include);
             if (!string.IsNullOrEmpty(exclude)) matcher.AddExclude(exclude);
@@ -132,5 +149,58 @@ public class CodeSearchTool : ITool
         {
             return $"执行 codesearch 时出错: {ex.Message}";
         }
+    }
+
+    private async Task<string?> ExecuteExaAsync(string query, int tokensNum, CancellationToken cancellationToken)
+    {
+        var payload = new
+        {
+            jsonrpc = "2.0",
+            id = 1,
+            method = "tools/call",
+            @params = new
+            {
+                name = "get_code_context_exa",
+                arguments = new
+                {
+                    query,
+                    tokensNum
+                }
+            }
+        };
+
+        var request = new HttpRequestMessage(HttpMethod.Post, "https://mcp.exa.ai/mcp")
+        {
+            Content = JsonContent.Create(payload)
+        };
+        request.Headers.Add("accept", "application/json, text/event-stream");
+
+        var response = await _httpClient.SendAsync(request, cancellationToken);
+        if (!response.IsSuccessStatusCode)
+        {
+            return null;
+        }
+
+        var text = await response.Content.ReadAsStringAsync(cancellationToken);
+        var lines = text.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        foreach (var line in lines)
+        {
+            if (!line.StartsWith("data: ")) continue;
+            var json = line.Substring(6);
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.TryGetProperty("result", out var result) &&
+                result.TryGetProperty("content", out var content) &&
+                content.ValueKind == JsonValueKind.Array &&
+                content.GetArrayLength() > 0)
+            {
+                var item = content[0];
+                if (item.TryGetProperty("text", out var textProp))
+                {
+                    return textProp.GetString();
+                }
+            }
+        }
+
+        return null;
     }
 }

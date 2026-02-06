@@ -109,7 +109,7 @@ public class Program
             if (string.IsNullOrEmpty(defaultModel))
             {
                 AnsiConsole.MarkupLine("[yellow]提示: 尚未配置默认模型。[/]");
-                AnsiConsole.MarkupLine("[grey]请运行 'config set model <provider>/<model>' 进行设置，例如 'config set model openai/gpt-4o'。[/]");
+                AnsiConsole.MarkupLine("[grey]请运行 'config set model <provider>/<model>' 进行设置，例如 'config set model openai/gpt-5'。[/]");
             }
             else
             {
@@ -250,20 +250,27 @@ public class Program
                     _ = currentWorkflow.RunAsync("ThinkingExecutor", promptText, cts.Token);
                     await foreach (var output in currentWorkflow.Output.WithCancellation(cts.Token))
                     {
-                        if (output is JsonNode node)
-                        {
-                            var status = node["status"]?.ToString();
-                            if (status == "thinking") {
-                                if (showThinking) {
-                                    var msg = node["message"]?.ToString();
-                                    tui.UpdateStatus(msg ?? "Thinking");
-                                }
-                            } else if (status == "thinking_stream") {
-                                if (node["delta"] != null) {
-                                    var delta = node["delta"]?.ToString();
-                                    tui.AppendAssistantDelta(delta ?? "");
-                                }
-                            } else if (status == "completed") {
+                            if (output is JsonNode node)
+                            {
+                                var status = node["status"]?.ToString();
+                                if (status == "thinking") {
+                                    if (showThinking) {
+                                        var msg = node["message"]?.ToString();
+                                        tui.UpdateStatus(msg ?? "Thinking");
+                                        if (!string.IsNullOrEmpty(msg)) tui.AddThinkingMessage(msg);
+                                    }
+                                } else if (status == "thinking_stream") {
+                                    if (node["delta"] != null) {
+                                        var delta = node["delta"]?.ToString();
+                                        tui.AppendAssistantDelta(delta ?? "");
+                                    }
+                                } else if (status == "acting") {
+                                    var tool = node["tool"]?.ToString();
+                                    if (!string.IsNullOrEmpty(tool))
+                                    {
+                                        tui.AddToolMessage(tool);
+                                    }
+                                } else if (status == "completed") {
                                 var answer = node["answer"]?.ToString();
                                 tui.AddChatMessage("assistant", answer ?? "");
                                 tui.UpdateStatus("Ready");

@@ -60,7 +60,12 @@ public class ForkService
         var timeline = await _sessionService.GetTimelineAsync(sessionId);
         if (fromMessageId != null)
         {
-            timeline = timeline.Where(t => t.MessageId != fromMessageId).ToList();
+            var forkMessage = messages.FirstOrDefault(m => m.Id == fromMessageId);
+            if (forkMessage != null)
+            {
+                var forkTime = forkMessage.Metadata.Created;
+                timeline = timeline.Where(t => NormalizeTimestamp(t.Timestamp) <= forkTime).ToList();
+            }
         }
 
         foreach (var ev in timeline)
@@ -169,6 +174,12 @@ public class ForkService
     public static string GetForkedTitle(string originalTitle, int forkNumber)
     {
         return $"{originalTitle} (fork #{forkNumber})";
+    }
+
+    private static long NormalizeTimestamp(long timestamp)
+    {
+        const long threshold = 1_000_000_000_000;
+        return timestamp > threshold ? timestamp / 1000 : timestamp;
     }
 
     public record ForkChainItem

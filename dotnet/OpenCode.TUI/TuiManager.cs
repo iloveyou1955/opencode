@@ -2,9 +2,11 @@ using Terminal.Gui;
 using OpenCode.Core.Models;
 using OpenCode.Core.Services;
 using OpenCode.Core.Utilities;
-using System.Text.Json.Nodes;
 using OpenCode.TUI.Services;
 using OpenCode.TUI.UI;
+using OpenCode.Core.Contracts;
+using Spectre.Console;
+using System.Linq;
 
 using OpenCode.Core.Attributes;
 using Microsoft.Extensions.DependencyInjection;
@@ -18,6 +20,11 @@ public class TuiManager
     private readonly StatsService _statsService;
     private readonly DialogService _dialogService;
     private readonly ConfigService _configService;
+    private readonly IProjectContext _projectContext;
+    private readonly McpService _mcpService;
+    private readonly UpgradeService _upgradeService;
+    private readonly ModelDiscoveryService _discovery;
+    private readonly AuthService _authService;
     
     private Window? _mainWindow;
     private View? _header;
@@ -25,30 +32,62 @@ public class TuiManager
     private Label? _shortcuts;
     private Label? _tipIcon;
     private Label? _tipText;
+    private Label? _agentTag;
+    private Label? _modelTag;
+    private Label? _providerTag;
     private View? _statusBar;
+    private Label? _pathLabel;
+    private Label? _mcpLabel;
+    private Label? _versionLabel;
     private View? _chatContainer;
     private View? _chatHeader;
     private Label? _sessionTitle;
     private Label? _chatStats;
-    private TextField? _inputField;
+    private TextView? _inputField;
+    private Label? _inputPlaceholder;
     private TextView? _chatView;
+    private FrameView? _sidebar;
+    private ListView? _sessionList;
+    private ListView? _timelineList;
 
     private bool _isChatMode = false;
     private string _currentStatus = "Ready";
     private string _currentSessionId = "None";
-    private List<string> _chatHistory = new();
-    private List<string> _sessions = new();
-    private List<string> _timeline = new();
+    private string _currentModel = "unknown";
+    private string _currentAgent = "default";
+    private readonly List<string> _chatHistory = new();
+    private readonly List<SessionMetadata> _sessions = new();
+    private readonly List<string> _timeline = new();
+    private readonly List<string> _promptHistory = new();
+    private int _promptIndex = -1;
+    private string _lastThinking = "";
+    private readonly List<string> _tips = new()
+    {
+        "Use /share to create a public link to your conversation",
+        "Use /unshare to remove a session from public access",
+        "Press Ctrl+K to open the command palette",
+        "Press Ctrl+L to quickly switch sessions",
+        "Use /fork to branch a session from a message",
+        "Use /revert to roll back to a timeline event",
+        "Use /archive to hide inactive sessions",
+        "Use /stats to review model usage and cost",
+        "Use /help to list all available commands"
+    };
     private SessionStats? _stats;
 
     public event Func<string, Task>? OnCommandSubmitted;
 
-    public TuiManager(SessionService sessionService, StatsService statsService, DialogService dialogService, ConfigService configService)
+    public TuiManager(SessionService sessionService, StatsService statsService, DialogService dialogService, ConfigService configService, IProjectContext projectContext, McpService mcpService, UpgradeService upgradeService, ModelDiscoveryService discovery, AuthService authService)
     {
         _sessionService = sessionService;
         _statsService = statsService;
         _dialogService = dialogService;
         _configService = configService;
+        _projectContext = projectContext;
+        _mcpService = mcpService;
+        _upgradeService = upgradeService;
+        _discovery = discovery;
+        _authService = authService;
     }
 
     public void InitGui()
@@ -134,46 +173,56 @@ public class TuiManager
             Focus = Terminal.Gui.Attribute.Make(Color.White, Color.Black)
         };
 
-        _inputField = new TextField("Type a message...")
+        _inputField = new TextView()
         {
             X = 2,
             Y = 1,
             Width = Dim.Fill() - 2,
-            Height = 1,
+            Height = 3,
             ColorScheme = inputScheme
         };
 
-        _inputField.Enter += (args) => {
-            if (_inputField.Text.ToString() == "Type a message...") {
-                _inputField.Text = "";
-                _inputField.ColorScheme = accentScheme;
-                _inputField.CursorPosition = 0; // 确保光标在最前面
+        _inputPlaceholder = new Label("Type a message or / for commands")
+        {
+            X = 2,
+            Y = 1,
+            ColorScheme = mutedScheme
+        };
+
+        _inputField.Enter += (args) =>
+        {
+            if (_inputPlaceholder != null) _inputPlaceholder.Visible = false;
+            _inputField.ColorScheme = accentScheme;
+        };
+
+        _inputField.Leave += (args) =>
+        {
+            if (string.IsNullOrWhiteSpace(_inputField.Text.ToString()))
+            {
+                if (_inputPlaceholder != null) _inputPlaceholder.Visible = true;
+                _inputField.ColorScheme = mutedScheme;
             }
         };
 
-        _inputField.Leave += (args) => {
-            if (string.IsNullOrWhiteSpace(_inputField.Text.ToString())) {
-                _inputField.Text = "Type a message...";
-                _inputField.ColorScheme = mutedScheme; // 失去焦点且为空时恢复暗色
+        _inputField.KeyDown += (args) =>
+        {
+            var key = args.KeyEvent.Key;
+            if (key == (Key.Enter | Key.ShiftMask))
+            {
+                _inputField.Text += "\n";
+                args.Handled = true;
+                return;
             }
-        };
 
-        _inputField.KeyDown += (args) => {
-            if (args.KeyEvent.Key == Key.Enter)
+            if (key == Key.Enter)
             {
                 var text = _inputField.Text.ToString();
-                // 如果是占位符，回车时先清空并返回（不提交）
-                if (text == "Type a message...") {
-                    _inputField.Text = "";
-                    _inputField.ColorScheme = accentScheme;
-                    args.Handled = true;
-                    return;
-                }
-
                 var cmd = text?.Trim();
                 // 1. 防呆：过滤掉空提交
                 if (!string.IsNullOrEmpty(cmd))
                 {
+                    _promptHistory.Add(cmd);
+                    _promptIndex = _promptHistory.Count;
                     // 2. 状态保护：禁用输入以防重复提交（简单防呆）
                     _inputField.ReadOnly = true; 
                     
@@ -184,6 +233,7 @@ public class TuiManager
                             Application.MainLoop.Invoke(() => {
                                 _inputField.ReadOnly = false;
                                 _inputField.Text = "";
+                                if (_inputPlaceholder != null) _inputPlaceholder.Visible = true;
                                 if (!_isChatMode) EnterChatMode();
                                 _inputField.SetFocus();
                             });
@@ -192,29 +242,57 @@ public class TuiManager
                 }
                 args.Handled = true;
             }
+
+            if (key == (Key.CtrlMask | Key.CursorUp))
+            {
+                if (_promptHistory.Count == 0)
+                {
+                    args.Handled = true;
+                    return;
+                }
+
+                _promptIndex = Math.Max(0, _promptIndex - 1);
+                _inputField.Text = _promptHistory[_promptIndex];
+                if (_inputPlaceholder != null) _inputPlaceholder.Visible = false;
+                args.Handled = true;
+            }
+
+            if (key == (Key.CtrlMask | Key.CursorDown))
+            {
+                if (_promptHistory.Count == 0)
+                {
+                    args.Handled = true;
+                    return;
+                }
+
+                _promptIndex = Math.Min(_promptHistory.Count, _promptIndex + 1);
+                _inputField.Text = _promptIndex >= _promptHistory.Count ? "" : _promptHistory[_promptIndex];
+                if (_inputPlaceholder != null) _inputPlaceholder.Visible = string.IsNullOrWhiteSpace(_inputField.Text.ToString());
+                args.Handled = true;
+            }
         };
 
         // 标签组：模块化、扁平化
-        var sisyphusTag = new Label(" Sisyphus ") 
+        _agentTag = new Label($" {_currentAgent} ") 
         { 
             X = 2, Y = 3, 
             ColorScheme = new ColorScheme { Normal = Terminal.Gui.Attribute.Make(Color.Black, Color.BrightCyan) } 
         };
-        var agentTag = new Label(" Grok Code Fast 1 ") 
+        _modelTag = new Label($" {_currentModel} ") 
         { 
-            X = Pos.Right(sisyphusTag) + 1, Y = 3, 
+            X = Pos.Right(_agentTag) + 1, Y = 3, 
             ColorScheme = new ColorScheme { Normal = Terminal.Gui.Attribute.Make(Color.BrightCyan, Color.Black) } 
         };
-        var routerTag = new Label(" OpenRouter ") 
+        _providerTag = new Label(" default ") 
         { 
-            X = Pos.Right(agentTag) + 1, Y = 3, 
+            X = Pos.Right(_modelTag) + 1, Y = 3, 
             ColorScheme = mutedScheme
         };
 
-        _inputWrapper.Add(focusIndicator, _inputField, sisyphusTag, agentTag, routerTag);
+        _inputWrapper.Add(focusIndicator, _inputField, _inputPlaceholder, _agentTag, _modelTag, _providerTag);
 
         // --- 3. 快捷键提示: 低调、对齐 ---
-        _shortcuts = new Label("ctrl+k commands  /  ctrl+l sessions")
+        _shortcuts = new Label("ctrl+k menu  /  ctrl+l sessions  /  ctrl+n new  /  ctrl+m models  /  ctrl+p providers")
         {
             X = Pos.Center(),
             Y = Pos.Bottom(_inputWrapper) + 1,
@@ -227,7 +305,7 @@ public class TuiManager
             Y = Pos.AnchorEnd(5), 
             ColorScheme = new ColorScheme { Normal = Terminal.Gui.Attribute.Make(Color.BrightYellow, Color.Black) } 
         };
-        _tipText = new Label("Use --format json for machine-readable output in scripts") { 
+        _tipText = new Label(_tips[0]) { 
             X = Pos.Right(_tipIcon) + 2, 
             Y = Pos.AnchorEnd(5), 
             ColorScheme = mutedScheme 
@@ -243,14 +321,14 @@ public class TuiManager
             ColorScheme = mutedScheme
         };
 
-        var pathLabel = new Label(" 󱂵 D:\\Work\\Opencode") { X = 2, Y = 0 };
-        var mcpLabel = new Label("⊙ 3 MCP") { X = Pos.Center(), Y = 0, ColorScheme = new ColorScheme { Normal = Terminal.Gui.Attribute.Make(Color.BrightGreen, Color.Black) } };
-        var versionLabel = new Label("v1.1.51 ") { X = Pos.AnchorEnd(10), Y = 0 };
-        _statusBar.Add(pathLabel, mcpLabel, versionLabel);
+        _pathLabel = new Label($" 󱂵 {_projectContext.Directory}") { X = 2, Y = 0 };
+        _mcpLabel = new Label("⊙ 0 MCP") { X = Pos.Center(), Y = 0, ColorScheme = new ColorScheme { Normal = Terminal.Gui.Attribute.Make(Color.BrightGreen, Color.Black) } };
+        _versionLabel = new Label($"v{_upgradeService.GetCurrentVersion()} ") { X = Pos.AnchorEnd(12), Y = 0 };
+        _statusBar.Add(_pathLabel, _mcpLabel, _versionLabel);
 
         // --- 6. 聊天容器: 沉浸式阅读体验 ---
         _chatHeader = new View() { 
-            X = 0, Y = 0, Width = Dim.Fill(), Height = 2, 
+            X = Pos.Right(_sidebar), Y = 0, Width = Dim.Fill() - 32, Height = 2, 
             Visible = false, 
             ColorScheme = mainScheme 
         };
@@ -259,11 +337,58 @@ public class TuiManager
         _chatStats = new Label("24,067 tokens  ·  9% usage") { X = Pos.AnchorEnd(35), Y = 0, ColorScheme = mutedScheme };
         _chatHeader.Add(chatAccentBar, _sessionTitle, _chatStats);
 
-        _chatContainer = new View()
+        _sidebar = new FrameView("Sessions")
         {
             X = 0,
             Y = 2,
+            Width = 32,
+            Height = Dim.Fill() - 9,
+            Visible = false,
+            ColorScheme = mainScheme
+        };
+
+        _sessionList = new ListView()
+        {
+            X = 0,
+            Y = 0,
             Width = Dim.Fill(),
+            Height = Dim.Percent(60),
+            AllowsMarking = false,
+            ColorScheme = mainScheme
+        };
+        _sessionList.OpenSelectedItem += (args) =>
+        {
+            if (args.Item >= 0 && args.Item < _sessions.Count)
+            {
+                var selected = _sessions[args.Item];
+                _ = Task.Run(async () => await LoadSessionAsync(selected.Id));
+            }
+        };
+
+        var timelineFrame = new FrameView("Timeline")
+        {
+            X = 0,
+            Y = Pos.Bottom(_sessionList),
+            Width = Dim.Fill(),
+            Height = Dim.Fill()
+        };
+        _timelineList = new ListView()
+        {
+            X = 0,
+            Y = 0,
+            Width = Dim.Fill(),
+            Height = Dim.Fill(),
+            AllowsMarking = false,
+            ColorScheme = mutedScheme
+        };
+        timelineFrame.Add(_timelineList);
+        _sidebar.Add(_sessionList, timelineFrame);
+
+        _chatContainer = new View()
+        {
+            X = Pos.Right(_sidebar),
+            Y = 2,
+            Width = Dim.Fill() - 32,
             Height = Dim.Fill() - 9, // 为底部输入框留出空间
             Visible = false,
             ColorScheme = mainScheme
@@ -278,7 +403,7 @@ public class TuiManager
         };
         _chatContainer.Add(_chatView);
 
-        _mainWindow.Add(_header, _inputWrapper, _shortcuts, _tipIcon, _tipText, _statusBar, _chatHeader, _chatContainer);
+        _mainWindow.Add(_header, _inputWrapper, _shortcuts, _tipIcon, _tipText, _statusBar, _chatHeader, _sidebar, _chatContainer);
         top.Add(_mainWindow);
 
         SetupGlobalKeybindings(top);
@@ -298,6 +423,21 @@ public class TuiManager
                 ShowSessionList();
                 args.Handled = true;
             }
+            else if (args.KeyEvent.Key == (Key.CtrlMask | Key.N))
+            {
+                _ = Task.Run(async () => await NewSessionAsync());
+                args.Handled = true;
+            }
+            else if (args.KeyEvent.Key == (Key.CtrlMask | Key.M))
+            {
+                ShowModelList();
+                args.Handled = true;
+            }
+            else if (args.KeyEvent.Key == (Key.CtrlMask | Key.P))
+            {
+                ShowProviderList();
+                args.Handled = true;
+            }
             else if (args.KeyEvent.Key == Key.Esc && _dialogService.IsDialogOpen)
             {
                 _dialogService.CloseDialog();
@@ -308,31 +448,208 @@ public class TuiManager
 
     private void ShowCommandPalette()
     {
-        var options = new List<CommandOption>
+        ShowMenu("Menu", new List<CommandOption>
         {
-            new() { Title = "New Session", Action = () => _ = Task.Run(async () => await NewSessionAsync()) },
-            new() { Title = "Switch Layout", Action = () => { if (_isChatMode) ExitChatMode(); else EnterChatMode(); } },
-            new() { Title = "Toggle Context Compression", Action = () => ToggleContextCompression() },
-            new() { Title = "Settings", Action = () => ShowSettings() },
-            new() { Title = "Exit", Action = () => Application.RequestStop() }
-        };
+            new() { Title = "Sessions", Description = "Manage sessions", Action = () => ShowSessionMenu() },
+            new() { Title = "Models", Description = "Switch models", Action = () => ShowModelMenu() },
+            new() { Title = "Providers", Description = "Connect providers", Action = () => ShowProviderMenu() },
+            new() { Title = "Tools", Description = "MCP, worktree, shell", Action = () => ShowToolMenu() },
+            new() { Title = "System", Description = "Help, stats, settings", Action = () => ShowSystemMenu() },
+            new() { Title = "New Session", Description = "Start a new chat", Action = () => _ = Task.Run(async () => await NewSessionAsync()) },
+            new() { Title = "Toggle Layout", Description = "Home or chat layout", Action = () => { if (_isChatMode) ExitChatMode(); else EnterChatMode(); } }
+        });
+    }
 
-        var dialog = new CommandDialog(_dialogService, options);
+    private void ShowMenu(string title, IEnumerable<CommandOption> options)
+    {
+        var dialog = new CommandDialog(_dialogService, title, options);
         _dialogService.ShowDialog(dialog);
+    }
+
+    private void SubmitCommand(string command)
+    {
+        if (OnCommandSubmitted == null) return;
+        _ = Task.Run(async () => await OnCommandSubmitted(command));
+    }
+
+    private void ShowSessionMenu()
+    {
+        ShowMenu("Sessions", new List<CommandOption>
+        {
+            new() { Title = "New session", Description = "Create a new chat", Action = () => _ = Task.Run(async () => await NewSessionAsync()) },
+            new() { Title = "List sessions", Description = "Open a session", Action = () => ShowSessionList() },
+            new() { Title = "Timeline", Description = "Show timeline", Action = () => ShowTimeline() },
+            new() { Title = "Share", Description = "/share", Action = () => SubmitCommand("share") },
+            new() { Title = "Unshare", Description = "/unshare", Action = () => SubmitCommand("unshare") },
+            new() { Title = "Fork", Description = "/fork", Action = () => SubmitCommand("fork") },
+            new() { Title = "Revert", Description = "/revert", Action = () => SubmitCommand("revert") },
+            new() { Title = "Redo", Description = "/redo", Action = () => SubmitCommand("redo") },
+            new() { Title = "Undo", Description = "/undo", Action = () => SubmitCommand("undo") },
+            new() { Title = "Archive", Description = "/archive", Action = () => SubmitCommand("archive") },
+            new() { Title = "Unarchive", Description = "/unarchive", Action = () => SubmitCommand("unarchive") },
+            new() { Title = "Export", Description = "/export", Action = () => SubmitCommand("export") },
+            new() { Title = "Import", Description = "/import", Action = () => SubmitCommand("import") },
+            new() { Title = "Rename", Description = "/rename", Action = () => SubmitCommand("rename") },
+            new() { Title = "Delete", Description = "/delete", Action = () => SubmitCommand("delete") }
+        });
+    }
+
+    private void ShowModelMenu()
+    {
+        ShowMenu("Models", new List<CommandOption>
+        {
+            new() { Title = "Switch model", Description = "Choose a model", Action = () => ShowModelList() },
+            new() { Title = "List models", Description = "/model list", Action = () => SubmitCommand("model list") },
+            new() { Title = "Model info", Description = "/model info <id>", Action = () => SubmitCommand("model info") },
+            new() { Title = "Search models", Description = "/model search <query>", Action = () => SubmitCommand("model search") }
+        });
+    }
+
+    private void ShowProviderMenu()
+    {
+        ShowMenu("Providers", new List<CommandOption>
+        {
+            new() { Title = "Connect provider", Description = "/auth login", Action = () => ShowProviderList() },
+            new() { Title = "Auth list", Description = "/auth list", Action = () => SubmitCommand("auth list") },
+            new() { Title = "Auth status", Description = "/auth status", Action = () => SubmitCommand("auth status") },
+            new() { Title = "Auth logout", Description = "/auth logout", Action = () => SubmitCommand("auth logout") }
+        });
+    }
+
+    private void ShowToolMenu()
+    {
+        ShowMenu("Tools", new List<CommandOption>
+        {
+            new() { Title = "MCP list", Description = "/mcp list", Action = () => SubmitCommand("mcp list") },
+            new() { Title = "Worktree list", Description = "/worktree list", Action = () => SubmitCommand("worktree list") },
+            new() { Title = "Worktree create", Description = "/worktree create", Action = () => SubmitCommand("worktree create") },
+            new() { Title = "Worktree remove", Description = "/worktree remove", Action = () => SubmitCommand("worktree remove") },
+            new() { Title = "Worktree reset", Description = "/worktree reset", Action = () => SubmitCommand("worktree reset") }
+        });
+    }
+
+    private void ShowSystemMenu()
+    {
+        ShowMenu("System", new List<CommandOption>
+        {
+            new() { Title = "Help", Description = "/help", Action = () => SubmitCommand("help") },
+            new() { Title = "Stats", Description = "/stats", Action = () => SubmitCommand("stats") },
+            new() { Title = "Config", Description = "/config", Action = () => SubmitCommand("config") },
+            new() { Title = "Upgrade", Description = "/upgrade", Action = () => SubmitCommand("upgrade") },
+            new() { Title = "Settings", Description = "Not implemented", Action = () => ShowSettings() },
+            new() { Title = "Exit", Description = "Close OpenCode", Action = () => Application.RequestStop() }
+        });
     }
 
     private void ShowSessionList()
     {
         _ = Task.Run(async () =>
         {
-            var sessions = await _sessionService.ListSessionsAsync();
+            var sessions = await _sessionService.ListSessionMetadataAsync();
             Application.MainLoop.Invoke(() =>
             {
-                var dialog = new FuzzySearchList<string>("Sessions", sessions, s => s);
+                var dialog = new FuzzySearchList<SessionMetadata>("Sessions", sessions, s => $"{s.Title ?? "Untitled"} · {s.Id}");
                 dialog.OnItemSelected += (s) =>
                 {
                     _dialogService.CloseDialog();
-                    _ = Task.Run(async () => await LoadSessionAsync(s));
+                    _ = Task.Run(async () => await LoadSessionAsync(s.Id));
+                };
+                dialog.OnCancelled += () => _dialogService.CloseDialog();
+                _dialogService.ShowDialog(dialog);
+            });
+        });
+    }
+
+    private void ShowTimeline()
+    {
+        _ = Task.Run(async () =>
+        {
+            var timeline = await _sessionService.GetTimelineAsync(_currentSessionId);
+            var rows = timeline.Select(entry => $"{entry.Type} · {entry.Id}").ToList();
+            Application.MainLoop.Invoke(() =>
+            {
+                var dialog = new FuzzySearchList<string>("Timeline", rows, s => s);
+                dialog.OnItemSelected += _ => _dialogService.CloseDialog();
+                dialog.OnCancelled += () => _dialogService.CloseDialog();
+                _dialogService.ShowDialog(dialog);
+            });
+        });
+    }
+
+    private void ShowModelList()
+    {
+        _ = Task.Run(async () =>
+        {
+            var providers = await _discovery.GetModelsAsync();
+            var models = providers.Values
+                .SelectMany(p => p.Models.Values.Select(m => new
+                {
+                    Id = $"{p.Id}/{m.Id}",
+                    Label = $"{p.Id}/{m.Id} · {m.Name}"
+                }))
+                .OrderBy(m => m.Id == "openai/gpt-5" ? 0 : 1)
+                .ThenBy(m => m.Id)
+                .Select(m => m.Label)
+                .ToList();
+
+            if (models.Count == 0)
+            {
+                AddSystemMessage("No models discovered. Run /auth login to add a provider.");
+                return;
+            }
+
+            Application.MainLoop.Invoke(() =>
+            {
+                var dialog = new FuzzySearchList<string>("Models", models, s => s);
+                dialog.OnItemSelected += (s) =>
+                {
+                    _dialogService.CloseDialog();
+                    var model = s.Split('·')[0].Trim();
+                    _ = Task.Run(async () =>
+                    {
+                        _configService.Config.Model = model;
+                        await _configService.SaveAsync();
+                        AddSystemMessage($"Model switched to {model}");
+                        await RefreshDataAsync();
+                    });
+                };
+                dialog.OnCancelled += () => _dialogService.CloseDialog();
+                _dialogService.ShowDialog(dialog);
+            });
+        });
+    }
+
+    private void ShowProviderList()
+    {
+        _ = Task.Run(async () =>
+        {
+            var auths = await _authService.AllAsync();
+            var providers = (await _discovery.GetModelsAsync()).Values.Select(p => p.Id).ToHashSet();
+            foreach (var key in auths.Keys) providers.Add(key);
+
+            var options = providers
+                .OrderBy(x => x)
+                .Select(p => $"{p} · {(auths.ContainsKey(p) ? "connected" : "disconnected")}")
+                .ToList();
+
+            if (options.Count == 0)
+            {
+                AddSystemMessage("No providers available. Use /auth login to add one.");
+                return;
+            }
+
+            Application.MainLoop.Invoke(() =>
+            {
+                var dialog = new FuzzySearchList<string>("Providers", options, s => s);
+                dialog.OnItemSelected += (s) =>
+                {
+                    _dialogService.CloseDialog();
+                    var provider = s.Split('·')[0].Trim();
+                    _ = Task.Run(async () =>
+                    {
+                        AddSystemMessage($"Starting auth flow for {provider}...");
+                        if (OnCommandSubmitted != null) await OnCommandSubmitted($"auth login {provider}");
+                    });
                 };
                 dialog.OnCancelled += () => _dialogService.CloseDialog();
                 _dialogService.ShowDialog(dialog);
@@ -346,6 +663,7 @@ public class TuiManager
         Application.MainLoop.Invoke(() =>
         {
             SetSessionId(sessionId);
+            SetSessionTitle("New Session");
             _chatHistory.Clear();
             UpdateChatView();
             if (!_isChatMode) EnterChatMode();
@@ -355,9 +673,11 @@ public class TuiManager
     private async Task LoadSessionAsync(string sessionId)
     {
         await LoadHistoryAsync(sessionId);
+        var meta = await _sessionService.GetMetadataAsync(sessionId);
         Application.MainLoop.Invoke(() =>
         {
             SetSessionId(sessionId);
+            if (meta?.Title != null) SetSessionTitle(meta.Title);
             if (!_isChatMode) EnterChatMode();
         });
     }
@@ -395,6 +715,7 @@ public class TuiManager
 
         // 2. 隐藏沟通界面组件
         if (_chatHeader != null) _chatHeader.Visible = false;
+        if (_sidebar != null) _sidebar.Visible = false;
         if (_chatContainer != null) _chatContainer.Visible = false;
 
         // 3. 输入框重定位到屏幕中心
@@ -428,6 +749,7 @@ public class TuiManager
 
         // 2. 激活沟通界面组件
         if (_chatHeader != null) _chatHeader.Visible = true;
+        if (_sidebar != null) _sidebar.Visible = true;
         if (_chatContainer != null) _chatContainer.Visible = true;
 
         // 3. 悬浮感输入框重定位到底部
@@ -435,7 +757,7 @@ public class TuiManager
         {
             _inputWrapper.X = Pos.Center();
             _inputWrapper.Y = Pos.AnchorEnd(7); // 固定到底部上方
-            _inputWrapper.Width = Dim.Fill() - 10; // 宽度拉伸
+            _inputWrapper.Width = Dim.Fill() - 6; // 宽度拉伸
         }
 
         // 4. 沟通模式下的快捷键提示
@@ -458,13 +780,17 @@ public class TuiManager
     public void UpdateStatus(string status)
     {
         _currentStatus = status;
-        // Status can be shown in the chat stats or title in the future
+        if (_chatStats != null)
+        {
+            _chatStats.Text = $"{_currentStatus}";
+            _chatStats.SetNeedsDisplay();
+        }
     }
 
     public void SetSessionId(string sessionId)
     {
         _currentSessionId = sessionId;
-        if (_sessionTitle != null && string.IsNullOrEmpty(_sessionTitle.Text.ToString()))
+        if (_sessionTitle != null)
         {
             _sessionTitle.Text = $"# {sessionId}";
         }
@@ -496,7 +822,7 @@ public class TuiManager
                 // 新建消息块
                 var icon = "󰚩";
                 var role = "ASSISTANT";
-                var formatted = $"\n{icon} {role} · x-ai/grok-code-fast-1\n{delta}";
+                var formatted = $"\n{icon} {role} · {_currentModel}\n{delta}";
                 _chatHistory.Add(formatted);
             }
             UpdateChatView();
@@ -516,7 +842,7 @@ public class TuiManager
         };
         
         var formatted = role.ToLower() == "assistant" 
-            ? $"\n{icon} {role.ToUpper()} · x-ai/grok-code-fast-1 · 9.8s\n{message}\n"
+            ? $"\n{icon} {role.ToUpper()} · {_currentModel}\n{message}\n"
             : $"\n{icon} {role.ToUpper()}\n{message}\n";
             
         // 简单去重：防止某些事件冒泡或并发导致的完全重复消息
@@ -552,6 +878,20 @@ public class TuiManager
         UpdateChatView();
     }
 
+    public void AddThinkingMessage(string message)
+    {
+        if (string.IsNullOrWhiteSpace(message)) return;
+        if (message == _lastThinking) return;
+        _lastThinking = message;
+        AddSystemMessage($"Thinking: {message}");
+    }
+
+    public void AddToolMessage(string message)
+    {
+        if (string.IsNullOrWhiteSpace(message)) return;
+        AddSystemMessage($"Tool: {message}");
+    }
+
     private void UpdateChatView()
     {
         if (_chatView != null)
@@ -583,36 +923,104 @@ public class TuiManager
 
     public void AddRenderable(object renderable)
     {
-        // 如果是 string 且包含特定的标记（如 Spectre.Console.Table 的 toString），进行清理或格式化
-        var text = renderable.ToString() ?? "";
-        if (text.Contains("Spectre.Console.Table"))
+        if (renderable is Table table)
         {
-            // 这是一个降级处理：在 TUI 中我们目前无法直接渲染 Spectre 的 Table 对象，
-            // 只能提取其中的文本或将其转换为简单的文本列表。
-            // 暂时将其显示为系统通知，避免破坏界面。
-            return; 
+            AddSystemMessage(RenderTable(table));
+            return;
         }
-        
-        AddSystemMessage(text);
+
+        AddSystemMessage(renderable.ToString() ?? "");
     }
 
     public async Task RefreshDataAsync()
     {
-        _sessions = await _sessionService.ListSessionsAsync();
+        _sessions.Clear();
+        _sessions.AddRange(await _sessionService.ListSessionMetadataAsync());
         if (_currentSessionId != "None")
         {
             var timeline = await _sessionService.GetTimelineAsync(_currentSessionId);
-            _timeline = timeline.Select(e => $"[{DateTimeOffset.FromUnixTimeMilliseconds(e.Timestamp).LocalDateTime:HH:mm:ss}] {e.Type}").ToList();
+            _timeline.Clear();
+            _timeline.AddRange(timeline.Select(e => $"[{FormatTimestamp(e.Timestamp)}] {e.Type}"));
         }
         _stats = await _statsService.AggregateAsync();
+
+        var config = _configService.Config;
+        _currentModel = config.Model ?? Environment.GetEnvironmentVariable("OPENAI_MODEL") ?? "unknown";
+        _currentAgent = config.DefaultAgent ?? "default";
         
         // Update UI components if needed
         Application.MainLoop.Invoke(() => {
-            if (_chatStats != null && _stats != null)
+            if (_chatStats != null)
             {
-                _chatStats.Text = $"{_stats.TotalCost:F4}  9% (${_stats.TotalCost:F2}) v1.1.51";
+                var sessionStats = _sessionService.GetStatsAsync(_currentSessionId).GetAwaiter().GetResult();
+                if (sessionStats != null)
+                {
+                    var tokens = sessionStats.TotalTokens.Input + sessionStats.TotalTokens.Output;
+                    _chatStats.Text = $"{_currentStatus} · {tokens} tokens · ${sessionStats.TotalCost:F4}";
+                }
+                else
+                {
+                    _chatStats.Text = $"{_currentStatus} · 0 tokens · $0.0000";
+                }
+            }
+
+            var current = _sessions.FirstOrDefault(s => s.Id == _currentSessionId);
+            if (current != null && !string.IsNullOrEmpty(current.Title))
+            {
+                SetSessionTitle(current.Title);
+            }
+
+            if (_sessionList != null)
+            {
+                var labels = _sessions
+                    .Select(s => $"{s.Title ?? "Untitled"} · {DateTimeOffset.FromUnixTimeSeconds(s.UpdatedAt).LocalDateTime:MM-dd HH:mm}")
+                    .ToList();
+                _sessionList.SetSource(labels);
+                var index = _sessions.FindIndex(s => s.Id == _currentSessionId);
+                if (index >= 0) _sessionList.SelectedItem = index;
+            }
+
+            _timelineList?.SetSource(_timeline);
+
+            if (_mcpLabel != null)
+            {
+                var count = _mcpService.GetServers().Count;
+                _mcpLabel.Text = $"⊙ {count} MCP";
+            }
+
+            if (_agentTag != null) _agentTag.Text = $" {_currentAgent} ";
+            if (_modelTag != null) _modelTag.Text = $" {_currentModel} ";
+            if (_providerTag != null)
+            {
+                var parts = _currentModel.Split('/', StringSplitOptions.RemoveEmptyEntries);
+                _providerTag.Text = parts.Length > 1 ? $" {parts[0]} " : " default ";
+            }
+
+            if (_tipText != null)
+            {
+                var tip = _tips.Count > 0 ? _tips[DateTimeOffset.UtcNow.Second % _tips.Count] : "";
+                _tipText.Text = tip;
             }
         });
+    }
+
+    private string RenderTable(Table table)
+    {
+        var headers = table.Columns.Select(c => c.Header.ToString()).ToList();
+        var lines = new List<string> { string.Join(" | ", headers) };
+        foreach (var row in table.Rows)
+        {
+            var cells = row.Cells.Select(cell => cell.ToString()).ToList();
+            lines.Add(string.Join(" | ", cells));
+        }
+        return string.Join("\n", lines);
+    }
+
+    private static string FormatTimestamp(long timestamp)
+    {
+        const long threshold = 1_000_000_000_000;
+        var value = timestamp > threshold ? timestamp : timestamp * 1000;
+        return DateTimeOffset.FromUnixTimeMilliseconds(value).LocalDateTime.ToString("HH:mm:ss");
     }
 
     public void Render()

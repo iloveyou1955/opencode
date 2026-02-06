@@ -6,8 +6,8 @@ namespace OpenCode.TUI.UI;
 
 public class CommandDialog : FuzzySearchList<CommandOption>
 {
-    public CommandDialog(DialogService dialogService, IEnumerable<CommandOption> options) 
-        : base("Command Palette", options, o => o.Title)
+    public CommandDialog(DialogService dialogService, string title, IEnumerable<CommandOption> options) 
+        : base(title, options, o => string.IsNullOrWhiteSpace(o.Description) ? o.Title : $"{o.Title} · {o.Description}")
     {
         OnItemSelected += (option) =>
         {
